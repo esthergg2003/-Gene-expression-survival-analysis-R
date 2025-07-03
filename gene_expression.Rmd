@@ -1,0 +1,379 @@
+---
+title: "Differential Gene Expression Analysis in Acute Myeloid Leukemia Cases"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+date: "2025-02-26"
+bibliography: references.bib
+link-citations: true
+---
+
+<style>
+  p { text-align: justify; }
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(TCGAbiolinks)
+library(dplyr)
+library(DT)
+library(SummarizedExperiment)
+library(kableExtra)
+library(fastmap)
+library(magrittr)  
+library(xfun)
+library(pheatmap)
+library(matrixStats)
+library(limma)
+library(edgeR)
+library(GO.db)
+library(HDO.db)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ape)
+library(ggplot2)
+library(enrichplot)
+library(fgsea)
+
+load(file="./ClinicalData.RData")
+load(file="./Expression.RData")
+
+ClinicalData$primary_diagnosis <- factor(ClinicalData$primary_diagnosis,levels = c("Acute myeloid leukemia without maturation","Acute myeloid leukemia with maturation","Acute promyelocytic leukaemia, t(15;17)(q22;q11-12)"))
+table(ClinicalData$primary_diagnosis)
+unique(ClinicalData$primary_diagnosis)
+
+ClinicalData$age_at_diagnosis <- ClinicalData$age_at_diagnosis / 365.25
+ClinicalData$age_group <- ifelse(ClinicalData$age_at_diagnosis < 60, 1, 0) #menor de 60 es 1
+ClinicalData$age_group <- factor(ClinicalData$age_group, 
+                                 levels = c(0, 1), 
+                                 labels = c("Mayor de 60", "Menor de 60"))
+ClinicalData$gender <- factor(ClinicalData$gender, levels = c("female", "male"))
+ClinicalData$race <- factor(ClinicalData$race)
+
+df_limpio <- ClinicalData[!(ClinicalData$race %in% c("not reported", "asian")) & !is.na(ClinicalData$race), ]
+df_limpio$race <- droplevels(df_limpio$race)
+df_limpio <- df_limpio[complete.cases(df_limpio[,c('primary_diagnosis','gender','race', 'age_group')]), ]
+expression_filtrado <- Expression[, colnames(Expression) %in% rownames(df_limpio)]
+dim(expression_filtrado)
+```
+
+## 1. Introduction
+
+Acute Myeloid Leukemia (AML) is a heterogenous group of blood cancers. A malignant disease characterized by the uncontrolled proliferation of abnormal myeloid cells in the bone marrow and blood [pag web]. As an acute leukemia, AML progresses rapidly, and is typically fatal within weeks or months if left untreated (pag web). It is the most common form of leukemia in adults, posing a significant challenge in hematologic oncology [@wachter2024aml]. Early diagnosis and prompt treatment are crucial, and significant progress has been made in the genetic characterization of the disease. A better understanding of AML’s genetic drivers and biology has led to improved treatment options [@estey2022aml_mds]. Advancements in genetic testing have shown that around 10–15% of AML cases are associated with inherited genetic factors, meaning that some patients have a higher risk of developing the disease due to mutations passed down through their family. [@wachter2024aml] However, as AML involves various types of cancer, more research about the molecular differences between AML subtypes and their potential clinical implications is needed.
+
+In this study, we performed a comprehensive gene expression analysis to investigate different AML subtypes: Acute Myeloid Leukemia with Maturation, Acute Myeloid Leukemia without Maturation and Acute Promyelocytic Leukemia. Our analysis aimed to identify molecular differences between these subtypes and assess their potential associations with key demographic factors. To achieve this, we conducted differential gene expression analysis followed by functional enrichment analysis, allowing us to uncover biological pathways that may contribute to disease heterogeneity. Our findings highlight potential biomarkers that could aid in personalized treatment.
+
+## 2. Material & Methods
+
+This chapter provides a comprehensive overview of the datasets and methodologies used in this study. The pipeline implemented in this study involved a comprehensive approach to data curation, preprocessing, statistical modeling, and visualization. The use of linear modeling and gene set enrichment analysis allowed for the identification of differentially expressed genes and their associated biological pathways. The entire pipeline was executed in Rstudio under the version 4.2.2 (2022-10-31). Key libraries such as limma, edgeR, clusterProfiler, and fgsea were employed to perform differential expression analysis, gene set enrichment, and functional annotation.To ensure reproducibility and efficiency, the pipeline was designed with modularity in mind, allowing for easy adaptation to different datasets or research questions.
+
+### 2.1 Cohort Selection and Data Acquisition
+
+The data was obtained from The Cancer Genome Atlas (TCGA) and carefully curated to ensure consistency across different analyses. Data import and processing were conducted using libraries from the open-source software project Bioconductor. Specifically, we utilized the TCGAbiolinks package.
+
+To retrieve relevant experiments, we used the getGDCprojects function, which returns a data frame containing available LAML (Acute Myeloid Leukemia) projects in TCGA. Among the various data categories, this study focuses specifically on Transcriptome Profiling.
+
+
+```{r 1, echo=TRUE}
+Dmatrix <- model.matrix(~ primary_diagnosis + gender + race + age_group, data = df_limpio)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+### 2.2 Data Curation
+
+The first step in the analysis involved curating and preparing the clinical and gene expression data for downstream analysis. The clinical data (`ClinicalData`) was processed to ensure consistency and usability. Key steps included:
+
+- Factorization of specific levels, such as gender, race, primary_diagnosis and its subsequent EDA analysis by calculating the distribution of the categorical labels in the entire dataset.
+- Patients were categorized into two age groups:  "young" (age < 60 years, coded as 1) and "older" (age ≥ 60 years, coded as 0).
+- Entries labeled as “not reported in the race column were removed to ensure data quality. The cleaned dataset was further filtered to retain only complete cases for the columns mentioned above. 
+
+Next, the gene expression data (‘Expression’) was filtered to match the samples present in the cleaned clinical dataset. This ensured that the expression matrix and the clinical data were aligned for downstream analysis.
+
+### 2.3 Formulating Hypothesis
+
+The formulation of the hypothesis involved preparing the data for statistical modeling. The cleaned dataset was utilized to construct a design matrix for linear modeling. The rank of the design matrix was checked to ensure there was no collinearity among the variables, indicating no redundancy.
+
+To achieve this, we examined the information from our variable ClinicalData. It was confirmed that there is linear independence among the columns (no multicollinearity among the variables), which helps avoid erroneous results in the subsequent differential gene expression analysis.
+
+```{r 2, echo=TRUE}
+Dmatrix <- model.matrix(~ primary_diagnosis + gender + race + age_group, data = df_limpio)
+```
+
+
+Next, a contrast matrix was constructed to define specific comparisons of interest. The comparisons made are as follows:
+
+1. "Acute myeloid leukemia with maturation" vs "Acute myeloid leukemia without maturation".
+2. "Acute promyelocytic leukemia" vs "Acute myeloid leukemia without maturation".
+3. "Acute myeloid leukemia with maturation" vs "Acute promyelocytic leukemia".
+4. "Male" vs "Female".
+5. "Black or African American" vs "White".
+6. "Young" (age < 60) vs "Older" (age ≥ 60).
+
+```{r 3, echo=TRUE}
+Cmatrix <- cbind(
+  c(0, 1, 0, 0, 0, 0), 
+  c(0, 0, 1, 0, 0, 0),  
+  c(0, 1, -1, 0, 0, 0), 
+  
+  c(0, 0, 0, 1, 0, 0),  
+  c(0, 0, 0, 0, 1, 0), 
+  c(0, 0, 0, 0, 0, 1)  
+)
+
+Cmatrix
+```
+
+
+Throughout the project, we will focus particularly on contrasts 2, 3, and 6, as they yield the most significant results.
+For reference in the design matrix, we will use the following categories:
+
+- Primary Diagnosis: Acute Myeloid Leukemia Without Maturation
+- Gender: Female
+- Race: Black of African
+- Age Group: Greater than 60 years
+
+### 2.4 Data Preprocessing
+
+To ensure the accuracy of this study, all data lacking relevant information was removed to prevent drawing invalid conclusions. The clinical data was curated by standardizing categorical variables such as primary diagnosis, gender, race, and age at diagnosis. The primary diagnosis variable was converted into a factor with specific levels, while the age at diagnosis was transformed from days to years and categorized into two groups: younger than 60 years (1) and 60 or older (0). Additionally, the gender and race variables were converted into categorical factors, and missing or unreported values in the race variable were excluded to maintain data integrity.
+
+The gene expression data underwent preprocessing to ensure quality and consistency. A boxplot of the raw expression values revealed significant variability, prompting the application of a log2 transformation to stabilize the variance. Lowly expressed genes were filtered out, retaining only those with sufficient expression across samples. The filtered data was then normalized, and variance stabilization was applied to correct systematic biases.
+
+To facilitate a direct comparison between different samples, RNA-Seq data normalization was performed, a crucial step in any study utilizing this technology. After normalization, a mean-variance trend analysis was conducted using the Voom method, and the corresponding plots were generated to illustrate the effects of the transformation.
+
+Finally, the impact of normalization was evaluated by comparing the pre- and post-normalization gene expression data. Two boxplots of gene expression were included: one for the uncorrected data and another for the corrected data, demonstrating the effectiveness of the variance stabilization process.
+
+
+```{r 4, echo=FALSE, include=FALSE}
+boxplot(expression_filtrado[,1:20]) 
+boxplot(log2(0.5+expression_filtrado[,1:20]))
+
+### 1. Filtering, removing genes less expressed
+dge <- DGEList(counts = expression_filtrado) #create DGEList variable
+keep <- filterByExpr(dge,Dmatrix) #apply filtering function
+table(keep) # los false son los que eliminamos
+dge <- dge[keep,,keep.lib.sizes=FALSE]
+
+dge <- calcNormFactors(dge) #normalization, método TMM (Trimmed Mean of M-values)
+v <- voom(dge, Dmatrix, plot=TRUE) # variance stabilization
+boxplot(log2(0.5+dge$counts[,1:20]))
+
+boxplot(v$E[,1:20])
+```
+
+### 2.5 Linear Modeling and Differential Expression Analysis
+
+Linear modeling was performed using the voom package. Since the limma package was originally designed for microarray data analysis, voom extends its functionality by applying the same t-test while incorporating an additional variance adjustment specifically for RNA-Seq data.The normalized and variance-stabilized expression data was fitted to the design matrix, and contrasts were applied to identify differentially expressed genes (DEGs). P-value histograms were generated for each contrast to assess the distribution of p-values and ensure the validity of the statistical tests.
+
+To determine which contrast would be the most interesting to analyze, we examined the histograms of the p-values and observed the approximate value of the density distribution. 
+The closer the p-value is to zero, the more significant the difference, as the majority of p-values will be near zero. This procedure allowed us to verify whether our initial statistical analysis was performed correctly before conducting more detailed studies.
+
+```{r 5, echo=TRUE}
+fit <- lmFit(v, Dmatrix)
+fit2 <- contrasts.fit(fit, Cmatrix)
+fit2 <- eBayes(fit2)
+
+par(mfrow=c(1,3))
+
+hist(fit2$p.value[,2],100,main="Acute promyelocytic leukaemia vs Acute myeloid leukemia without maturation")
+
+hist(fit2$p.value[,3],100,main="Acute myeloid leukemia with maturation vs Acute promyelocytic leukaemia")
+
+hist(fit2$p.value[,6],100,main="Menor de 60 años vs Mayor de 60 años")
+
+par(mfrow=c(1,1))
+
+```
+
+```{r 6, echo=FALSE, include=FALSE}
+Contraste_2 <- topTable(fit = fit2, coef = 2, number = Inf)
+Contraste_3 <- topTable(fit = fit2, coef = 3, number = Inf)
+Contraste_6 <- topTable(fit = fit2, coef = 6, number = Inf)
+```
+
+We can determine our adjusted p-values at a glance from the histogram and tailor them to each case. From the exploration of the histograms, we identified that the most interesting contrasts are 2, 3, and 6 for the reasons mentioned earlier.
+
+### 2.6 Over Representation Analysis (ORA)
+
+The ORA (Over Representation Analysis) helps identify which defined gene groups are more present in a specific subset of interest, such as cancer-related genes, than what would be expected by chance. In this way, using Gene Ontology, we can group genes according to their function. They can be classified into three categories:
+
+- Molecular Function (MF)
+- Cellular Component (CC)
+- Biological Processes (BP)
+
+As we can see, we conducted enrichment analysis to identify the functions of the genes according to their characteristics. We obtained three main biological processes that are represented in a list of differentially expressed genes.
+
+```{r 7, echo=TRUE}
+gene_all_2 <- rownames(Contraste_2)[which(Contraste_2$adj.P.Val < 0.01)]
+gene_over_2 <- rownames(Contraste_2)[which(Contraste_2$adj.P.Val < 0.0025 & Contraste_2$logFC > 0)]
+gene_under_2 <- rownames(Contraste_2)[which(Contraste_2$adj.P.Val < 0.0025 & Contraste_2$logFC < 0)]
+
+gene_over_2 <- gsub("\\..*","",gene_over_2)
+universe <- gsub("\\..*","",rownames(Contraste_2))
+ego_ora_bp_2 <- enrichGO(gene = gene_over_2,
+                       universe = universe,
+                       OrgDb = org.Hs.eg.db,
+                       keyType = "ENSEMBL",
+                       ont = "BP",
+                       pvalueCutoff = 0.005,
+                       qvalueCutoff = 0.05,
+                       readable = FALSE)
+```
+
+```{r 8, echo=FALSE, include=FALSE}
+gene_all_3 <- rownames(Contraste_3)[which(Contraste_3$adj.P.Val < 0.01)]
+gene_over_3 <- rownames(Contraste_3)[which(Contraste_3$adj.P.Val < 0.0025 & Contraste_3$logFC > 0)]
+gene_under_3 <- rownames(Contraste_3)[which(Contraste_3$adj.P.Val < 0.0025 & Contraste_3$logFC < 0)]
+
+gene_over_3 <- gsub("\\..*","",gene_over_3)
+universe <- gsub("\\..*","",rownames(Contraste_3))
+ego_ora_bp_3 <- enrichGO(gene = gene_over_3,
+                         universe = universe,
+                         OrgDb = org.Hs.eg.db,
+                         keyType = "ENSEMBL",
+                         ont = "BP",
+                         pvalueCutoff = 0.005,
+                         qvalueCutoff = 0.05,
+                         readable = FALSE)
+
+gene_all_6 <- rownames(Contraste_6)[which(Contraste_6$adj.P.Val < 0.01)]
+gene_over_6 <- rownames(Contraste_6)[which(Contraste_6$adj.P.Val < 0.0025 & Contraste_6$logFC > 0)]
+gene_under_6 <- rownames(Contraste_6)[which(Contraste_6$adj.P.Val < 0.0025 & Contraste_6$logFC < 0)]
+
+gene_over_6 <- gsub("\\..*","",gene_over_6)
+universe <- gsub("\\..*","",rownames(Contraste_6))
+ego_ora_bp_6 <- enrichGO(gene = gene_over_6,
+                         universe = universe,
+                         OrgDb = org.Hs.eg.db,
+                         keyType = "ENSEMBL",
+                         ont = "BP",
+                         pvalueCutoff = 0.005,
+                         qvalueCutoff = 0.05,
+                         readable = FALSE)
+```
+
+### 2.7 Gene Set Enrichment Analysis (GSEA)
+
+Gene Set Enrichment Analysis (GSEA) was performed to identify biological pathways and processes associated with the differentially expressed genes. The `enrichGO` function from the `clusterProfiler` package was used for over-representation analysis (ORA), and the `fgsea` package was used for GSEA. Significant genes from each contrast were mapped to Gene Ontology (GO) terms, and enrichment results were visualized using bar plots and ridge plots.
+
+```{r 9, echo=FALSE, include=FALSE}
+#CONTRAST 3
+rankgenevector <- Contraste_3$t
+names(rankgenevector) <- gsub("\\..*","",rownames(Contraste_3))
+rankgenevector <- sort(rankgenevector,decreasing = TRUE)
+head(rankgenevector)
+
+ego_gsea_bp_3 <- gseGO(geneList = rankgenevector,
+                       OrgDb = org.Hs.eg.db,
+                       keyType = "ENSEMBL",
+                       ont = "BP",
+                       nPerm = 10000,
+                       minGSSize = 10,
+                       maxGSSize = 500,
+                       pvalueCutoff = 0.05,
+                       verbose = FALSE)
+
+ii1 <-which.max(ego_gsea_bp_3@result$NES)
+
+#CONTRAST 6
+
+rankgenevector <- Contraste_6$t
+names(rankgenevector) <- gsub("\\..*","",rownames(Contraste_6))
+rankgenevector <- sort(rankgenevector,decreasing = TRUE)
+
+ego_gsea_bp_6 <- gseGO(geneList = rankgenevector,
+                     OrgDb = org.Hs.eg.db,
+                     keyType = "ENSEMBL",
+                     ont = "BP",
+                     nPerm = 10000,
+                     minGSSize = 10,
+                     maxGSSize = 500,
+                     pvalueCutoff = 0.05,
+                     verbose = FALSE)
+
+```
+
+### 2.8 Differential Expression Analysis
+
+Differential expression analysis was performed to identify genes significantly associated with each contrast. The results were further analyzed using Gene Ontology (GO) enrichment to identify biological pathways and processes associated with the differentially expressed genes (DEGs).
+
+A p-value is used to determine the statistical significance of the results, indicating the probability of observing the data, or something more extreme, under the null hypothesis. However, p-values do not account for the multiple testing problem. To address this, we compute the q-value, which adjusts the p-values for false discovery rate (FDR), providing a more accurate measure of significance when multiple comparisons are made.
+
+The results of the differential expression analysis and GO enrichment were summarized and visualized using bar plots and ridge plots. The top enriched GO terms for each contrast were identified, and their significance was assessed using adjusted p-values (q-values). The results were interpreted in the context of the biological hypotheses, providing insights into the molecular mechanisms underlying the differences between the compared groups.
+
+## 3.Results
+
+In the following section we are going to make an interpretation of the statistical analysis we have previously performed. 
+
+### 3.1 Histograms
+
+We analyzed the six different contrasts we previously talked about, using histograms generated from the obtained p-values of each contrasts. With these histograms, we have been able to visualize the distribution of the p-values and decide whether each contrast was significant in the expression analysis. After plotting the histograms, we observed that only three contrasts showed the expected distribution. In those showing differential expression,  we observed a significant peak near 0, indicating that we reject the null hypothesis for those contrasts. On the other hand,  for the remaining three contrasts: gender, race and Acute myeloid leukemia with and without maturation, we observed no significant pattern in the distribution of the p values, leading us to accept the null hypothesis.
+
+In two contrasts between leukemia subtypes, both histograms revealed strong differential expression.
+
+Focusing first on Acute promyelocytic leukaemia vs Acute myeloid leukemia without maturation, we identified 4150 differentially expressed genes, with an adjusted p-value < 0.01. A more detailed analysis showed that, applying a stricter threshold (adjusted p-value < 0.0025), 1882 genes were overexpressed (logFC > 0), and 1033 genes were underexpressed (logFC < 0).
+
+```{r hist, echo=TRUE}
+hist(fit2$p.value[,2],100,main="Acute promyelocytic leukaemia vs Acute myeloid leukemia without maturation")
+```
+
+Applying the same approach to the contrast Acute myeloid leukemia with maturation vs Acute promyelocytic leukaemia, we obtained a histogram similar to the one of the previous contrast. We found 4493 differentially expressed genes, with an adjusted p-value < 0.01. Using a stricter threshold, adjusted  p-value < 0.0025,  1120 genes were overexpressed and 2080 genes were underexpressed.
+
+```{r hist2, echo=TRUE}
+hist(fit2$p.value[,3],100,main="Acute myeloid leukemia with maturation vs Acute promyelocytic leukaemia")
+```
+
+Now we move on to our third histogram, where we compare patients diagnosed with Acute Myeloid Leukemia without maturation, dividing them into two groups: those under 60 years old and those over 60 years old. In this contrast, we also observed a peak in low p-values, close to zero. As the distribution of p.values is not uniform U(0,1), we reject the null hypothesis and conclude that there is a significant difference in gene expression between both age groups. However, unlike the previous contrasts between leukemia subtypes, in this case, the decrease in frequency after the peak at zero is more gradual, there are fewer significant p-values. This suggests that age-related differences in gene expression are less significant compared to the differences observed between leukemia subtypes.
+
+```{r hist3, echo=TRUE}
+hist(fit2$p.value[,6],100,main="Menor de 60 años vs Mayor de 60 años")
+```
+
+### 3.2 Enrichment Analysis
+
+Focusing now on these 3 significant contrasts, we have performed the enrichment analysis of each of them.
+
+- Acute promyelocytic leukaemia vs Acute myeloid leukemia without maturation.
+
+```{r ora1, echo=TRUE}
+barplot(ego_ora_bp_2, showCategory = 10) +
+  ggtitle("Análisis ORA - GO: Procesos Biológicos") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14))
+```
+
+The gene expression analysis identified several biological processes enriched in the differentially expressed gene set. The longer the bar the more differentially expressed genes have that function. The adjusted p-values indicate strong statistical significance, which is visually represented in the color scale. Terms that are more enriched are depicted in red shades, but the variation in the p value is really low. Among the most significant terms are ossification, indicating involvement in cellular differentiation and bone development (citar esto), skeletal system development, and regulation of the wound healing response, suggesting a potential activation of mechanisms related to tissue regeneration and remodeling. 
+
+- Acute myeloid leukemia with maturation vs Acute promyelocytic leukemia
+
+```{r ora2, echo=TRUE}
+barplot(ego_ora_bp_3, showCategory = 10) +
+  ggtitle("Análisis ORA - GO: Procesos Biológicos") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14))
+```
+
+Here we identified a significant enrichment in biological processes associated with antigen presentation and processing, with a particular emphasis on the class II major histocompatibility complex (MHC). Key terms include the assembly of the MHC class II protein complex, peptide antigen presentation, and immune response regulation, pointing to a crucial role in T cell activation and the adaptive immune response. The prominent presence of MHC class II-related terms suggests that these genes play a central role in specific immune mechanisms.
+
+For this contrast we also did a GSEA. We got that MHC class II protein complex assembly genes were the most differentially expressed. The graph illustrates two components: the Ranked List Metric and the Running Enrichment Score. In The Ranked List Metric genes positioned on the left are overexpressed, while genes on the right are underexpressed. In this case, the majority of the MHC class II protein complex assembly genes were overexpressed. In the Running Enrichment Score, the green curve represents the variation in the enrichment score. The highest point indicates the maximum enrichment score. Because we have this value on the left, it indicates that the gene set is enriched in the condition promoting their overexpression.
+
+```{r gsea1, echo=TRUE}
+gseaplot(ego_gsea_bp_3, geneSetID = ii1, title = ego_gsea_bp_3$Description[ii1])
+```
+
+- Young (age < 60) vs Older (age ≥ 60)
+
+```{r gsea2, echo=TRUE}
+ridgeplot(ego_gsea_bp_6, showCategory = 5, fill = "pvalue") +
+  ggtitle("Análisis de Enriquecimiento GO - Procesos Biológicos") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14))
+```
+
+For the sixth contrast, the ORA did not return any genes, meaning it did not recognize differentially expressed genes. When performing GSEA, we observed the same conclusion. The graph shows the 5 most overexpressed categories within the genes, but they all correspond to underexpressed genes, and by a small margin, there is no statistical significance.
+
+## 4. Conclusions
+
+In conclusion, our DEG across various contrasts has revealed significant insights into the molecular differences associated with Acute Myeloid Leukemia subtypes and age-related expression variations. The identification of various differentially expressed genes, particularly in the contrasts between Acute Promyelocytic Leukemia and Acute Myeloid Leukemia without maturation, underscores the potential biological implications of these findings. Furthermore, the enrichment analyses highlighted biological processes, such as antigen presentation and immune response modulation, which may inform therapeutic strategies. While age-related differences in gene expression were observed, they appeared less pronounced compared to subtype-specific variations, suggesting that the latter may play a role in the disease's underlying mechanisms. Overall, these findings contribute to a deeper understanding of the genetic landscape of leukemia and its potential pathways for intervention.
+
+## 5. References
+

@@ -1,0 +1,479 @@
+---
+title: "Survival Analysis in Oncology Patients"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+date: "2025-04-01"
+link-citations: true
+---
+
+```{=html}
+<style>
+  body { background-color: #f5f5f5; }
+  h1 { color: #000000; font-weight: bold; } /* Título principal en negro y negrita */
+  h2 { color: #800000; } /* Rojo burdeos */
+  h3 { color: #c0392b; } /* Rojo más claro */
+  p { text-align: justify; color: #333333; font-size: 14px; }
+  table { border: 1px solid #ddd; }
+</style>
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# ===========================
+# 1. LOAD LIBRARIES
+# ===========================
+
+library(Biobase)
+library(limma)
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(DT)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(enrichplot)
+library(TCGAbiolinks)
+library(dplyr)
+library(edgeR)
+library(ggplot2)
+library(car)
+library(gridExtra)
+library(tidyr)
+library(survival)
+library(glmnet)
+library(survminer)
+
+```
+
+## 1. Introduction
+
+Lung carcinoma is the leading cause of cancer-related mortality worldwide, with a 5-year survival rate of less than 20% in advanced stages [1]. This type of cancer is classified into two main subtypes: non-small cell lung cancer (NSCLC), which accounts for approximately 85% of cases, and small cell lung cancer (SCLC), a more aggressive form with a lower survival rate [2].
+
+Despite advances in early detection and treatment, lung carcinoma remains a major global health challenge due to its late-stage diagnosis and high metastatic potential. Understanding the factors that influence survival is crucial for improving prognosis and developing more effective therapeutic strategies.
+
+The objectives of survival analysis include the analysis of patterns of event times, the comparison of distributions of survival times in different groups of individuals and examining whether and by how much some factors affect the risk of an event of interest using survival curves, Cox regression models, and logistic regression [3]. The analysis identifies relevant clinical and demographic variables that may influence prognosis.
+
+
+## 2. Material & Methods
+
+### 2.1 Survival Analysis Design
+
+1. *Observation Period*  
+   The survival analysis was conducted using clinical data from oncology patients with a defined observation period ranging from the date of surgery (or diagnosis) up to the last known follow-up. The analysis includes follow-up times (Follow_up...290) measured in days, and the data were right-censored at the time of the last contact if no death was recorded. 
+   The data appears to have been recorded using structured clinical registries, likely derived from hospital records or follow-up systems
+
+2. *Handling of Censored Data*  
+   The event of interest was defined as *death* from any cause. Patients labeled as "Alive Free of Disease" or "Alive With Active Disease" in the Last_Known_Status column were coded as censored (Survival_Status = 0), whereas all forms of death ("Cancer-related Death" or "Other Causes Death") were considered events (Survival_Status = 1). 
+
+   Censored individuals (i.e., those who were alive at the last follow-up) were retained in the analysis. Their follow-up time until censorship contributed to the estimation of survival functions. This approach prevents bias by acknowledging the uncertainty of outcomes beyond the observation period.
+
+3. *Completeness and Balance of the Dataset*  
+   All patients included in the final dataset had valid survival time and event status. No individual was excluded due to missing survival information. Therefore, we can confirm that *the dataset is complete and balanced. For instance, stratifying survival by **gender* revealed a significant difference in survival curves, with females showing better outcomes. This supports both the integrity and clinical relevance of the dataset. 
+
+```{r inicio, include=FALSE}
+
+load("./datos_hospital.RData") 
+data <- midata_all_samples_global_surv
+
+data$Survival_Status <- ifelse(
+  data$Last_Known_Status %in% c("Alive Free of Disease", "Alive With Active Disease"),
+  0,
+  1
+)
+
+data$Survival_Status_texto <- ifelse(
+  data$Last_Known_Status %in% c("Alive Free of Disease", "Alive With Active Disease"),
+  'Alive',
+  'Dead'
+)
+```
+
+```{r}
+# Bar plot: Distribution of survival status by TUMOUR STAGE
+ggplot(data, aes(x = Pathologic_Tumour_Stage, fill = Survival_Status_texto)) +
+  geom_bar(position = "fill") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Distribution of Survival Status by Tumour Stage",
+    x = "Tumour Stage",
+    y = "Proportion",
+    fill = "Last Known Status"
+  ) +
+  theme_minimal()
+```
+
+
+### 2.2 Data Curation
+
+As previously mentioned, our objective is to study survival in cancer patients. To begin, we first verify that there are no missing values in the Survival_Status and Follow_up...290 columns. As we refine our selection of variables, we will remove any rows containing null values to ensure data consistency.
+
+Our dataset includes 829 living patients and 258 deceased patients. While the data is somewhat imbalanced, both outcomes have a substantial number of cases, allowing for meaningful analysis
+
+```{r setup_data, include=FALSE}
+
+head(data$Follow_up...290) # 1 MUERTO, 0 VIVO
+
+# Remove invalid or missing survival data
+rrx <- which(is.na(data$Survival_Status))
+if(length(rrx)>0){
+  data <- data[-rrx,]
+}
+
+if(any(data$Follow_up...290==0)){
+  rrx <- which(data$Follow_up...290==0)
+  data <- data[-rrx,]
+}
+
+# Remove rows with missing values in model variables
+vars_modelo <- c("Histological_Subtype", "Adenocarcinoma_Subtype",
+                 "Smoking", "Peripheral_Vascular_Disease",
+                 "Cardiovascular_Morbidity", "Pathologic_Tumour_Stage")
+
+#data <- data[complete.cases(data[, vars_modelo]), ]
+
+# Convert relevant variables to factors
+data$Histological_Subtype <- as.factor(data$Histological_Subtype)
+data$Adenocarcinoma_Subtype <- as.factor(data$Adenocarcinoma_Subtype)
+data$Pathologic_Tumour_Stage <- as.factor(data$Pathologic_Tumour_Stage)
+```
+
+### 2.3 Preprocessing: Variable Transformation
+
+In this section, the first thing we do is select continuous variables of interest, and then, convert them into discrete categories.
+
+```{r continuas, include=FALSE}
+# Age: binary (over 60 years)
+data$Age_over_60 <- ifelse(data$Age > 60, "Yes", "No")
+data$Age_over_60 <- factor(data$Age_over_60, levels = c("No", "Yes"))
+
+data <- data[!is.na(data$BMI), ]
+
+# BMI: standard WHO categories
+data$BMI_category <- cut(
+  data$BMI,
+  breaks = c(-Inf, 18.5, 25, 30, Inf),
+  labels = c("Underweight", "Normal", "Overweight", "Obese"),
+  right = FALSE
+)
+
+data <- data[!is.na(data$FVC), ]
+
+# FVC: respiratory function grouping
+data$FVC_category <- cut(
+  data$FVC,
+  breaks = c(-Inf, 50, 70, 80, Inf),
+  labels = c("Very low", "Low", "Moderate", "Normal"),
+  right = FALSE
+)
+
+# Tumor size: grouped in 4 levels
+data$Tumour_Size_cat <- cut(
+  data$Tumour_Size_mm,
+  breaks = c(-Inf, 10, 20, 30, Inf),
+  labels = c("Very small", "Small", "Medium", "Large"),
+  right = FALSE
+)
+```
+
+```{r}
+
+# Confirm variable creation
+summary(data[, c("Age_over_60", "BMI_category", "FVC_category", "Tumour_Size_cat")])
+
+```
+
+Based on this summary, we decided:
+
+-   **For FVC_category**: group all but ‘Normal’ into ‘Altered’
+
+-   **For BMI_category**: group ‘Underweight’ + ‘Normal’ as ‘≤ Normal’, and the rest as ‘Overweight/Obese’
+
+```{r continuas2, include=FALSE}
+# Final categories
+data$FVC_category <- ifelse(data$FVC_category == "Normal", "Normal", "Altered")
+data$FVC_category <- factor(data$FVC_category, levels = c("Normal", "Altered"))
+data$BMI_category <- ifelse(data$BMI_category %in% c("Underweight", "Normal"), 
+                            "≤ Normal", "Overweight/Obese")
+data$BMI_category <- factor(data$BMI_category, levels = c("≤ Normal", "Overweight/Obese"))
+```
+
+```{r}
+
+# Confirm variable creation
+summary(data[, c("Age_over_60", "BMI_category", "FVC_category", "Tumour_Size_cat")])
+
+```
+
+### 2.4 Variable Selection using Kaplan-Meier
+
+To identify the most relevant variables for our analysis, we first review all available categorical variables and select those that, based on our criteria, are most closely related to cancer prognosis.
+
+Once this initial selection is made, we generate Kaplan-Meier survival curves for each chosen variable, applying the log-rank test to compare survival distributions between groups. We examine these curves alongside their corresponding p-values to assess statistical significance. This process allows us to refine our selection, ensuring that only the most informative variables are included in subsequent analyses.
+
+
+### 2.5 Logistic Regression
+
+To further investigate the relationship between the selected variables and patient mortality, we performed multiple logistic regression to evaluate their joint effects on the likelihood of death. The model was constructed with the following steps:
+
+-   **Multiple Logistic Regression**: We included the variables identified through the Kaplan-Meier analysis in a multiple logistic regression model. The model was fit using a binomial logistic regression, where the dependent variable was Survival_Status (coded as 1 for deceased and 0 for alive). We used p-values (< 0.05) to assess the significance of each variable.
+
+-   **Simple Logistic Regressions**: To assess the independent contribution of each variable to mortality, we also performed simple logistic regressions by analyzing each variable separately with Survival_Status as the outcome.
+
+The p-values from each regression were examined to confirm the variables that were statistically significant.
+
+
+### 2.6 Cox Model
+
+To evaluate the simultaneous effect of multiple clinical and demographic variables on patient survival, a multivariable Cox proportional hazards regression model was applied.
+The initial set of covariates included only those variables that showed significant association with survival in previous univariate analyses (Kaplan-Meier survival curves and log-rank tests). These included:
+Adenocarcinoma_Subtype, Smoking, Peripheral_Vascular_Disease, Cardiovascular_Morbidity, Pathologic_Tumour_Stage, Diabetes, High_Blood_Pressure, Ischemic_Heart_Disease, Dyspnea_Scale_mMRC, Tumour_Density, Age_over_60, and Tumour_Size_cat.
+
+To avoid multicollinearity issues, we verified the independence of predictors using the Variance Inflation Factor (VIF), and removed any redundant variables.
+
+Model performance was evaluated using the concordance index (C-index), which reflects the model's ability to correctly rank survival times. The global significance of the model was assessed via the likelihood ratio test, Wald test, and score (log-rank) test.
+
+### 2.7 Analysis of Variance
+
+Beyond categorization (e.g., creating BMI groups), analyzing the variability of continuous variables provides important insights into their predictive potential. The rationale behind this approach is that variables with higher relative dispersion are more likely to have a significant impact on survival outcomes. Since raw variance can be influenced by differences in scale, we use the Coefficient of Variation (CV) as a standardized measure of dispersion. We calculate the CV for our four continuous variables (Age, BMI, FVC, and Tumor Size) and select only those with the highest CV values, ensuring that our features contribute meaningful variability to the analysis.
+
+```{r cont2, include=FALSE}
+vars_cont_analisis <- c("Age", "BMI", "FVC", "Tumour_Size_mm")
+data_continua <- data[, vars_cont_analisis]
+data_matrix <- as.matrix(data_continua)
+medias <- colMeans(data_matrix, na.rm = TRUE)  # Media de cada variable
+desv_std <- sqrt(colVars(data_matrix, useNames = TRUE))  # Desviación estándar
+cv <- desv_std / medias  
+cv_ordenado <- sort(cv, decreasing = TRUE)
+```
+
+```{r}
+print(cv_ordenado)
+```
+
+The obtained variables were Tumour size and FVC.
+
+## 3. Results
+
+### 3.1 Kaplan-Meier curve with log-rank test
+
+Using the log-rank test, we identified variables with p-values less than 0.05, indicating a significant association with survival. The following variables met this criterion:
+
+- Histological_Subtype, Adenocarcinoma_Subtype, Smoking, Peripheral_Vascular_Disease, Cardiovascular_Morbidity, Pathologic_Tumour_Stage, Diabetes, High_Blood_Pressure, Ischemic_Heart_Disease, Dyspnea_Scale_mMRC, Tumour_Density, Peripheral_Vascular_Disease, Age_over_60, Tumour_Size_cat.
+
+Here is the example of Smoking:
+
+```{r}
+# Kaplan-Meier curve
+
+data <- data[data$Smoking != 'Unknown', ]
+
+rrx <- which(is.na(data$Pathologic_Tumour_Stage))
+if(length(rrx)>0){
+  data <- data[-rrx,]
+}
+
+km_gender <- survfit(Surv(Follow_up...290, Survival_Status) ~ Smoking, data = data)
+ggsurvplot(km_gender, data = data, risk.table = TRUE, pval = TRUE,
+           title = "Survival by Smoking Status",
+           xlab = "Follow-up Time (days)",
+           ylab = "Survival Probability")
+
+```
+
+There are statistically significant differences (log-rank p = 0.019). Patients who have never smoked have better prognosis, while current smokers and recent ex-smokers have worse survival. This supports the role of smoking as a negative prognostic factor in this cohort.
+
+Here is an example of one of the variables we discarded, BMI:
+
+```{r}
+# Aplicamos Kaplan-Meier de nuevo
+modelo_bmi <- survfit(Surv(Follow_up...290, Survival_Status) ~ BMI_category, data = data)
+ggsurvplot(modelo_bmi, data = data, risk.table = TRUE, pval = TRUE,
+           title = "Supervivencia según BMI")
+```
+
+No clinical separation between BMI groups is apparent. The groups are well balanced in size, so class imbalance is not a concern. This suggests that BMI does not have a significant effect on survival in this cohort.
+
+### 3.3 Logistic Regression
+
+In our Logistic Regression analysis, we incorporated the variables identified in the previous section. The model results indicate that the variables Adenocarcinoma Subtype, Peripheral Vascular Disease, and Pathologic Tumor Stage are statistically significant (p-value < 0.05). A closer examination of the Estimates allows us to derive the following insights:
+
+-   **Pathologic Tumor Stage**: Higher tumor stages correspond to increasing Estimate values, which are consistently positive. This suggests a progressive rise in mortality risk as the disease advances.
+
+-   **Peripheral Vascular Disease**: The presence of this condition is associated with an Estimate of 0.8692, indicating a higher likelihood of mortality.
+
+-   **Adenocarcinoma Subtype**: The invasive subtypes with lepidic and papillary predominance exhibit negative Estimates, suggesting a potential protective effect against mortality.
+
+```{r logistic1, include=FALSE}
+modelo <- glm(Survival_Status ~ Adenocarcinoma_Subtype +
+                Smoking + Peripheral_Vascular_Disease + Cardiovascular_Morbidity +
+                Pathologic_Tumour_Stage + Diabetes + High_Blood_Pressure +
+                Ischemic_Heart_Disease + Dyspnea_Scale_mMRC + Tumour_Density + 
+                Peripheral_Vascular_Disease + Age_over_60 + Tumour_Size_cat,
+              family = binomial(link = "logit"),
+              data = data)
+summary(modelo)
+summary_modelo <- summary(modelo)$coefficients  
+significant_vars <- summary_modelo[summary_modelo[, 4] < 0.05, c(1, 4)]
+```
+
+```{r}
+print(significant_vars)
+```
+
+To further validate these findings, we conducted simple logistic regressions, analyzing each variable independently. The results confirmed that all selected variables significantly contribute to mortality prediction. Moreover, logistic regression across different time horizons reinforced these observations and provided greater analytical depth.
+
+In the following section, we present the p-values for one category of each variable to assess their statistical significance.
+
+```{r logistic2, include=FALSE}
+vars_total <- c("Adenocarcinoma_Subtype", "Smoking", "Peripheral_Vascular_Disease",
+                "Cardiovascular_Morbidity", "Pathologic_Tumour_Stage", "Diabetes", 
+                "High_Blood_Pressure", "Ischemic_Heart_Disease", "Dyspnea_Scale_mMRC", 
+                "Tumour_Density", "Age_over_60", "Tumour_Size_cat")
+
+resultados <- data.frame(Variable = character(), `p-value` = numeric())
+
+for (var in vars_total) {
+  formula <- as.formula(paste("Survival_Status ~", var)) 
+  modelo <- glm(formula, family = binomial(link = "logit"), data = data)  
+  pval <- summary(modelo)$coefficients[2, 4]  
+  resultados <- rbind(resultados, data.frame(Variable = var, `p-value` = signif(pval, 4)))
+}
+```
+
+```{r}
+print(resultados)
+```
+
+### 3.2 Cox model
+
+-   Cox model highlighted age and tumor stage as strong independent predictors of survival.
+
+```{r}
+# 1. Eliminar observaciones con 'Smoking == "Unknown"' por detección de colinealidad
+data <- data %>% filter(Smoking != "Unknown")
+data$Smoking <- droplevels(data$Smoking)
+# Multivariable cox model
+modelo_cox <- coxph(Surv(Follow_up...290, Survival_Status) ~ 
+                      Adenocarcinoma_Subtype +
+                      Smoking + Peripheral_Vascular_Disease +
+                      Cardiovascular_Morbidity + Pathologic_Tumour_Stage +
+                      Diabetes + High_Blood_Pressure + Ischemic_Heart_Disease +
+                      Dyspnea_Scale_mMRC + Tumour_Density + 
+                      Age_over_60 + Tumour_Size_cat,
+                    data = data)
+#summary(modelo_cox)
+
+tabla_cox <- summary(modelo_cox)$coefficients %>%
+  as.data.frame() %>%
+  mutate(
+    HR = exp(coef),
+    CI_lower = exp(coef - 1.96 * `se(coef)`),
+    CI_upper = exp(coef + 1.96 * `se(coef)`),
+    Variable = rownames(.)
+  ) %>%
+  select(Variable, HR, CI_lower, CI_upper, `Pr(>|z|)`) %>%
+  rename(`p-value` = `Pr(>|z|)`)
+
+#print(tabla_cox)
+
+# Now we will check there is no colinearity between the variables, and also that 
+#there is no hazard risk proportionality biases.
+
+#vif(modelo_cox)  # values > 5-10 indicate there is multicolinearity
+#cox.zph(modelo_cox)  # Prueba de proporcionalidad de riesgos
+```
+
+
+To assess multicollinearity between covariates, the Variance Inflation Factor (VIF) was calculated for each variable in the Cox model. All VIF values were below 1.5, indicating a low level of multicollinearity and confirming the independence of the predictors. Therefore, no variables were removed from the model due to redundancy.
+
+
+Additionally, the proportional hazards assumption was tested using the Schoenfeld residuals method implemented in the `cox.zph()` function. The global test returned a p-value of 0.13, indicating that the model as a whole does not violate the assumption of proportional hazards.
+
+Individually, none of the covariates showed significant violations (all p-values > 0.05), although *Pathologic_Tumour_Stage* had a borderline result (p = 0.07). A graphical inspection of the Schoenfeld residuals plot for this variable revealed that the estimated effect remained approximately constant over time, supporting its inclusion in the final model.
+
+These results support the validity of the Cox model for the variables included in the analysis.
+
+-   Concordance index (C-index): 0.708 (SE = 0.022) → indicates good predictive ability of the model.
+-   Likelihood ratio test: p = 7e-08 → significant
+-   Wald test: p = 1e-06 → significant
+-   Score (log-rank) test: p = 1e-08 → significant
+
+Note that although some categories of Smoking and Adenocarcinoma Subtype displayed trends towards increased or decreased risk, the corresponding hazard ratios were not statistically significant in this model.
+
+```{r}
+# Crear una fórmula sin esa variable
+modelo_cox_sin_problematicas <- coxph(Surv(Follow_up...290, Survival_Status) ~ 
+                                         Smoking + Peripheral_Vascular_Disease +
+                                         Cardiovascular_Morbidity + Pathologic_Tumour_Stage +
+                                         Diabetes + High_Blood_Pressure + Ischemic_Heart_Disease +
+                                         Dyspnea_Scale_mMRC + Tumour_Density + 
+                                         Age_over_60 + Tumour_Size_cat,
+                                       data = data)
+
+# Volver a intentar ggforest
+ggforest(modelo_cox_sin_problematicas, data = data,
+         main = "Cox Model: Hazard Ratios (Reduced Model)",
+         cpositions = c(0.02, 0.22, 0.4),
+         fontsize = 1, refLabel = "HR=1 (reference)", noDigits = 2)
+
+```
+
+```{r}
+# ===========================
+# 4.1 INDIVIDUAL RISK PREDICTION WITH COX MODEL
+# ===========================
+
+# Cox model using only Age and Gender
+cox_model_age_gender <- coxph(Surv(Follow_up...290, Survival_Status) ~ Age + Gender, data = data)
+
+# Predict individual relative risk (HR)
+predicted_risk <- predict(cox_model_age_gender, type = "risk")
+
+# Add prediction to the dataset
+data$Predicted_Risk <- predicted_risk
+
+
+# ===========================
+# 4.2 CLASSIFICATION BASED ON RISK GROUPS
+# ===========================
+
+# Split patients based on median risk into Low and High Risk
+group_risk <- ifelse(predicted_risk > median(predicted_risk), "High Risk", "Low Risk")
+
+# Create factor with explicit ordering
+data$Group_Age_Gender <- factor(group_risk, levels = c("Low Risk", "High Risk"))
+
+# Check distribution
+table(data$Group_Age_Gender)
+
+
+# ===========================
+# 4.3 Survival Curve by Risk Group
+# ===========================
+
+# Survival curve based on risk group (from Age + High_Blood_Pressure Cox model)
+modelo_surv_group <- survfit(Surv(Follow_up...290, Survival_Status) ~ Group_Age_Gender, data = data)
+
+ggsurvplot(modelo_surv_group, data = data, risk.table = TRUE, pval = TRUE,
+           title = "Survival by Risk Group (Age + High_Blood_Pressure)",
+           xlab = "Follow-up Time (days)",
+           ylab = "Survival Probability")
+
+```
+
+An automatic threshold (the median predicted risk) was used to define groups. As expected, patients in the "Low Risk" group show higher survival probability. The curves are significantly different, confirming the relevance of Age and Gender as independent survival predictors.
+
+
+## 4. Conclusions
+
+This study confirms that age and tumor stage are independent predictors of survival in oncology patients. Smoking and diabetes were also identified as relevant variables through univariate analysis. Stratifying patients by risk based on these features allows for clearer interpretation of prognosis. On the other hand, variables such as BMI or FVC showed no consistent association with survival. The use of multivariable Cox models, Kaplan-Meier curves, and time-dependent logistic regression proved effective to explore and validate potential prognostic factors.
+
+## 5. References
+
+[1] Sung, H., Ferlay, J., Siegel, R. L., Laversanne, M., Soerjomataram, I., Jemal, A., & Bray, F. (2021). Global Cancer Statistics 2020: GLOBOCAN Estimates of Incidence and Mortality Worldwide for 36 Cancers in 185 Countries. CA A Cancer Journal For Clinicians, 71(3), 209-249. https://doi.org/10.3322/caac.21660
+
+[2] Travis, W. D., Brambilla, E., Nicholson, A. G., Yatabe, Y., Austin, J. H., Beasley, M. B., Chirieac, L. R., Dacic, S., Duhig, E., Flieder, D. B., Geisinger, K., Hirsch, F. R., Ishikawa, Y., Kerr, K. M., Noguchi, M., Pelosi, G., Powell, C. A., Tsao, M. S., & Wistuba, I. (2015). The 2015 World Health Organization Classification of Lung Tumors. Journal Of Thoracic Oncology, 10(9), 1243-1260. https://doi.org/10.1097/jto.0000000000000630
+
+[3] Kartsonaki, C. (2016). Survival analysis. Diagnostic Histopathology, 22(7), 263-270. <https://doi.org/10.1016/j.mpdhp.2016.06.005>
